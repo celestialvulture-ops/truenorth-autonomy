@@ -749,23 +749,63 @@
     }
   }, { threshold: 0.4 }).observe(modStage);
 
-  // section videos: load when near, play while visible, keep each group in step
+  // section videos: load when near, play while visible.
+  // Videos of one group (same flight, same 35 s length) run as one clock:
+  //  - 'wait': all load; a video that is ready early holds its frame (no seeking) until every one has
+  //    >= 1.5 s buffered, then all start together from the same time
+  //  - 'run':  small drift is removed by nudging playbackRate (smooth); a hard seek only beyond 0.5 s
+  //  - if one runs out of data, all pause and go back to 'wait', so they never come apart
   const groups = {};
   document.querySelectorAll('video[data-group]').forEach(v => (groups[v.dataset.group] ||= []).push(v));
+  const ahead = v => {
+    for (let i = 0; i < v.buffered.length; i++)
+      if (v.buffered.start(i) <= v.currentTime + 0.05 && v.buffered.end(i) > v.currentTime) return v.buffered.end(i) - v.currentTime;
+    return 0;
+  };
+  const enough = v => v.readyState >= 3 && (ahead(v) >= 1.5 ||
+    (v.duration && v.buffered.length && v.buffered.end(v.buffered.length - 1) >= v.duration - 0.1));
   Object.values(groups).forEach(list => {
     const master = list[0], followers = list.slice(1);
+    let wanted = false, state = 'idle';
     const near = new IntersectionObserver(es => {
       if (es.some(e => e.isIntersecting)) { list.forEach(v => (v.preload = 'auto')); near.disconnect(); }
     }, { rootMargin: '100% 0px' });
     const visible = new Set();
     const watch = new IntersectionObserver(es => {
       es.forEach(e => e.isIntersecting ? visible.add(e.target) : visible.delete(e.target));
-      list.forEach(v => visible.size ? v.play().catch(() => {}) : v.pause());
+      wanted = visible.size > 0;
+      if (wanted && state === 'idle') { state = 'wait'; tick(); }
+      if (!wanted) { state = 'idle'; list.forEach(v => v.pause()); }
     }, { threshold: 0.2 });
-    list.forEach(v => { near.observe(v); watch.observe(v); });
-    master.addEventListener('timeupdate', () => followers.forEach(v => {
-      if (Math.abs(v.currentTime - master.currentTime) > 0.15) v.currentTime = master.currentTime;
-    }));
+    list.forEach(v => {
+      near.observe(v); watch.observe(v);
+      v.addEventListener('playing', () => { if (state !== 'run') v.pause(); });          // started early: hold the frame
+      v.addEventListener('waiting', () => {                                              // out of data: everyone waits
+        if (state === 'run') { state = 'wait'; list.forEach(o => o.pause()); }
+      });
+    });
+    const tick = () => {
+      if (state === 'wait') {
+        // phones only download after play(): kick each video once; it is paused again as soon as it plays
+        list.forEach(v => { if (!v._kicked && v.readyState < 3) { v._kicked = true; v.play().catch(() => {}); } });
+        if (list.every(enough)) {
+          const t = master.currentTime;
+          followers.forEach(v => { if (Math.abs(v.currentTime - t) > 0.04) v.currentTime = t; });
+          state = 'run';
+          list.forEach(v => { v.playbackRate = 1; v.play().catch(() => {}); });
+        }
+      } else if (state === 'run') {
+        const t = master.currentTime, dur = master.duration || 0;
+        followers.forEach(v => {
+          let d = v.currentTime - t;                                                     // > 0: follower ahead
+          if (dur) { if (d > dur / 2) d -= dur; else if (d < -dur / 2) d += dur; }      // across the loop point
+          if (Math.abs(d) > 0.5) { v.currentTime = t; v.playbackRate = 1; }
+          else if (Math.abs(d) > 0.02) v.playbackRate = 1 - Math.max(-0.15, Math.min(0.15, d * 1.5));
+          else v.playbackRate = 1;
+        });
+      }
+    };
+    setInterval(tick, 100);
   });
 
   // industries: panels cycle on their own while in view; real mouse movement pauses / picks one
